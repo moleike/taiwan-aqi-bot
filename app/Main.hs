@@ -1,6 +1,7 @@
 {-# LANGUAGE ApplicativeDo     #-}
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -11,7 +12,7 @@
 import           Control.Concurrent.Lifted   (fork, threadDelay)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar,
                                               readTVar)
-import           Control.Exception hiding (Handler)
+import           Control.Exception           hiding (Handler)
 import           Control.Monad               (forM, forM_, forever)
 import           Control.Monad.Error.Class
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
@@ -58,10 +59,35 @@ data AQData = AQData
   deriving (Eq, Show)
 
 data Env = Env
-  { token  :: ChannelToken
-  , secret :: ChannelSecret
-  , users  :: TVar [(Source, Coord)]
+  { envToken  :: ChannelToken
+  , envSecret :: ChannelSecret
+  , envUsers  :: TVar [(Source, Coord)]
   }
+
+class Monad m => MonadChannel m where
+  getToken  :: m ChannelToken
+  getSecret :: m ChannelSecret
+
+instance Monad m => MonadChannel (ReaderT Env m) where
+  getToken  = ask >>= \env -> return (envToken env)
+  getSecret = ask >>= \env -> return (envSecret env)
+
+class Monad m => MonadDatabase m where
+  getUsers :: m [(Source, Coord)]
+  addUser :: (Source, Coord) -> m ()
+
+instance MonadIO m => MonadDatabase (ReaderT Env m) where
+  getUsers = do
+    env <- ask
+    liftIO $ atomically $ do
+      xs <- readTVar (envUsers env)
+      case xs of
+        [] -> retry
+        _  -> return xs
+  addUser u = do
+    env <- ask
+    liftIO $ atomically $ modifyTVar (envUsers env) (u :)
+
 
 parseAQData :: Value -> Parser (Maybe AQData)
 parseAQData = withObject "AQData" $ \o -> runMaybeT $ do
@@ -131,21 +157,15 @@ getCoord AQData{..} = (lat, lng)
 closestTo :: [AQData] -> Coord -> AQData
 closestTo xs coord = (distance coord . getCoord) `minimumOn` xs
 
-askLoc :: (MonadReader Env m, MonadIO m) => ReplyToken -> m NoContent
+askLoc :: (MonadIO m, MonadChannel m) => ReplyToken -> m ()
 askLoc rt = do
-  Env {token} <- ask
+  token <- getToken
   _ <- liftIO $ runLine comp token
-  return NoContent
+  return ()
     where
       welcome = "Where are you?"
       qr      = QuickReply [QuickReplyButton Nothing (ActionLocation "location")]
       comp    = replyMessage rt [B.MessageText welcome (Just qr)]
-
-addUser :: (MonadReader Env m, MonadIO m) => Source -> Coord -> m NoContent
-addUser source coord = do
-  Env {users} <- ask
-  liftIO $ atomically $ modifyTVar users ((source, coord) :)
-  return NoContent
 
 unhealthy :: AQData -> Bool
 unhealthy AQData{..} = aqi > 100
@@ -155,37 +175,31 @@ notifyChat (Source a, x)
   | unhealthy x = pushMessage a [mkMessage x]
   | otherwise   = return NoContent
 
-processAQData :: (MonadReader Env m, MonadIO m) => m ()
+processAQData :: (MonadIO m, MonadChannel m, MonadDatabase m) => m ()
 processAQData = do
-  Env {users, token} <- ask
-  users' <- liftIO $ atomically $ do
-    xs <- readTVar users
-    case xs of
-      [] -> retry
-      _  -> return xs
+  token <- getToken
+  users <- getUsers
   liftIO $ getAQData >>= \aqData ->
-    let users'' = [(user, aqData `closestTo` coord) | (user, coord) <- users']
-    in  forM_ users'' $ flip runLine token . notifyChat
+    let users'' = [(user, aqData `closestTo` coord) | (user, coord) <- users]
+    in forM_ users'' $ flip runLine token . notifyChat
   return ()
 
-loop :: (MonadReader Env m, MonadIO m, MonadBaseControl IO m) => m ()
+loop :: (MonadChannel m, MonadDatabase m, MonadIO m, MonadBaseControl IO m) => m ()
 loop = do
   fork $ forever $ do
     threadDelay (120 * 10^6)
     processAQData
   return ()
 
-webhook :: (MonadReader Env m, MonadIO m) => [Event] -> m NoContent
+webhook :: (MonadChannel m, MonadDatabase m, MonadIO m) => [Event] -> m NoContent
 webhook events = do
   forM_ events $ \case
     EventFollow  {..} -> askLoc replyToken
     EventJoin    {..} -> askLoc replyToken
     EventMessage { message = W.MessageLocation {..}
                  , source
-                 }    -> addUser source (latitude, longitude)
-    _                 -> return NoContent
+                 }    -> addUser (source, (latitude, longitude))
   return NoContent
-    where handler _ = return NoContent
 
 aqServer :: ServerT Webhook (ReaderT Env Handler)
 aqServer = webhook . events
@@ -193,10 +207,11 @@ aqServer = webhook . events
 api = Proxy :: Proxy Webhook
 pc  = Proxy :: Proxy '[ChannelSecret]
 
-app :: MonadReader Env m => m Application
-app = ask >>= \env ->
+app :: (MonadReader Env m) => m Application
+app = do
+  env <- ask
   let server = hoistServerWithContext api pc (`runReaderT` env) aqServer
-  in  return $ serveWithContext api (secret env :. EmptyContext) server
+  return $ serveWithContext api (envSecret env :. EmptyContext) server
 
 main :: IO ()
 main = do
