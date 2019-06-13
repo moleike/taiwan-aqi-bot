@@ -175,23 +175,25 @@ notifyChat (Source a, x)
   | unhealthy x = pushMessage a [mkMessage x]
   | otherwise   = return NoContent
 
-processAQData :: (MonadIO m, MonadChannel m, MonadDatabase m) => m ()
-processAQData = do
-  token <- getToken
-  users <- getUsers
-  liftIO $ getAQData >>= \aqData ->
-    let users'' = [(user, aqData `closestTo` coord) | (user, coord) <- users]
-    in forM_ users'' $ flip runLine token . notifyChat
-  return ()
-
-loop :: (MonadChannel m, MonadDatabase m, MonadIO m, MonadBaseControl IO m) => m ()
+loop :: ( MonadChannel m
+        , MonadDatabase m
+        , MonadIO m
+        , MonadBaseControl IO m
+        ) => m ()
 loop = do
   fork $ forever $ do
-    threadDelay (120 * 10^6)
-    processAQData
+    token <- getToken
+    users <- getUsers
+    liftIO $ getAQData >>= \aqData ->
+      let users'' = [(user, aqData `closestTo` coord) | (user, coord) <- users]
+      in forM_ users'' $ flip runLine token . notifyChat
+    threadDelay (3600 * 10^6)
   return ()
 
-webhook :: (MonadChannel m, MonadDatabase m, MonadIO m) => [Event] -> m NoContent
+webhook :: ( MonadChannel m
+           , MonadDatabase m
+           , MonadIO m
+           ) => [Event] -> m NoContent
 webhook events = do
   forM_ events $ \case
     EventFollow  {..} -> askLoc replyToken
