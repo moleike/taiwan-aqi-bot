@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs             #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -10,14 +11,12 @@
 {-# LANGUAGE TypeOperators     #-}
 
 import           Control.Concurrent.Lifted   (fork, threadDelay)
-import           Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar,
-                                              readTVar)
 import           Control.Exception           hiding (Handler)
 import           Control.Monad               (forM, forM_, forever)
 import           Control.Monad.Error.Class
+import           Control.Monad.Except
 import           Control.Monad.IO.Class      (MonadIO, liftIO)
 import           Control.Monad.Reader
-import           Control.Monad.STM           (atomically, retry)
 import           Control.Monad.Trans.Class   (lift)
 import           Control.Monad.Trans.Control (MonadBaseControl, restoreT)
 import           Control.Monad.Trans.Maybe   (runMaybeT)
@@ -25,12 +24,15 @@ import           Data.Aeson
 import           Data.Aeson.QQ               (aesonQQ)
 import           Data.Aeson.Types
 import           Data.Bifunctor
+import qualified Data.ByteString             as BS
+import qualified Data.ByteString.Lazy        as LBS
 import           Data.List.Extra             (minimumOn)
 import           Data.Maybe                  (catMaybes)
 import           Data.String                 (fromString)
 import           Data.Text                   (Text)
 import qualified Data.Text                   as T
 import qualified Data.Vector                 as V
+import           Database.Redis              as R hiding (decode)
 import           Line.Bot.Client
 import           Line.Bot.Types              as B
 import           Line.Bot.Webhook            as W
@@ -61,7 +63,7 @@ data AQData = AQData
 data Env = Env
   { envToken  :: ChannelToken
   , envSecret :: ChannelSecret
-  , envUsers  :: TVar [(Source, Coord)]
+  , envConn   :: R.Connection
   }
 
 class Monad m => MonadChannel m where
@@ -69,25 +71,44 @@ class Monad m => MonadChannel m where
   getSecret :: m ChannelSecret
 
 instance Monad m => MonadChannel (ReaderT Env m) where
-  getToken  = ask >>= \env -> return (envToken env)
-  getSecret = ask >>= \env -> return (envSecret env)
+  getToken  = ask >>= return . envToken
+  getSecret = ask >>= return . envSecret
+
+encodeStrict :: ToJSON a => a -> BS.ByteString
+encodeStrict = LBS.toStrict . encode
+
+geoAdd :: (RedisCtx m f) => BS.ByteString -> Coord -> Source -> m (f Integer)
+geoAdd key (lat, lng) val  =
+  sendRequest $ ["GEOADD", key, encodeStrict lng, encodeStrict lat, encodeStrict val ]
+
+geoRadius
+  :: (RedisCtx m f)
+  => BS.ByteString
+  -> Coord
+  -> Double
+  -> BS.ByteString
+  -> m (f [BS.ByteString])
+geoRadius key (lat, lng) radius unit =
+  sendRequest $ ["GEORADIUS", key, encodeStrict lng, encodeStrict lat, encodeStrict radius, unit]
 
 class Monad m => MonadDatabase m where
-  getUsers :: m [(Source, Coord)]
-  addUser :: (Source, Coord) -> m ()
+  getUsers :: Coord -> m [Source]
+  addUser  :: Coord -> Source -> m ()
 
 instance MonadIO m => MonadDatabase (ReaderT Env m) where
-  getUsers = do
-    env <- ask
-    liftIO $ atomically $ do
-      xs <- readTVar (envUsers env)
-      case xs of
-        [] -> retry
-        _  -> return xs
-  addUser u = do
-    env <- ask
-    liftIO $ atomically $ modifyTVar (envUsers env) (u :)
+  getUsers coord = do
+    Env{envConn} <- ask
+    result <- liftIO $ first show <$> runRedis envConn (geoRadius "users" coord 30 "km")
+    case result >>= sequence . fmap eitherDecodeStrict of
+      Left e  -> do
+        liftIO $ print e
+        return []
+      Right r -> return r
 
+  addUser coord src = do
+    Env{envConn} <- ask
+    _ <- liftIO $ runRedis envConn (geoAdd "users" coord src)
+    return ()
 
 parseAQData :: Value -> Parser (Maybe AQData)
 parseAQData = withObject "AQData" $ \o -> runMaybeT $ do
@@ -175,32 +196,38 @@ notifyChat (Source a, x)
   | unhealthy x = pushMessage a [mkMessage x]
   | otherwise   = return NoContent
 
-loop :: ( MonadChannel m
-        , MonadDatabase m
-        , MonadIO m
-        , MonadBaseControl IO m
-        ) => m ()
+loop
+  :: ( MonadChannel m
+     , MonadDatabase m
+     , MonadIO m
+     , MonadBaseControl IO m
+     )
+  => m ()
 loop = do
   fork $ forever $ do
     token <- getToken
-    users <- getUsers
-    liftIO $ getAQData >>= \aqData ->
-      let users'' = [(user, aqData `closestTo` coord) | (user, coord) <- users]
-      in forM_ users'' $ flip runLine token . notifyChat
+    as <- liftIO $ filter unhealthy <$> getAQData
+    forM_ as $ \a -> do
+      let coord = (lat a, lng a)
+      users <- getUsers coord
+      liftIO $ forM_ users $ \src -> runLine (notifyChat (src, a)) token
     threadDelay (3600 * 10^6)
   return ()
 
-webhook :: ( MonadChannel m
-           , MonadDatabase m
-           , MonadIO m
-           ) => [Event] -> m NoContent
+webhook
+  :: ( MonadChannel m
+     , MonadDatabase m
+     , MonadIO m
+     )
+  => [Event]
+  -> m NoContent
 webhook events = do
   forM_ events $ \case
     EventFollow  {..} -> askLoc replyToken
     EventJoin    {..} -> askLoc replyToken
     EventMessage { message = W.MessageLocation {..}
                  , source
-                 }    -> addUser (source, (latitude, longitude))
+                 }    -> addUser (latitude, longitude) source
   return NoContent
 
 aqServer :: ServerT Webhook (ReaderT Env Handler)
@@ -219,7 +246,8 @@ main :: IO ()
 main = do
   token  <- fromString <$> getEnv "CHANNEL_TOKEN"
   secret <- fromString <$> getEnv "CHANNEL_SECRET"
-  env    <- atomically $ Env token secret <$> newTVar []
+  conn   <- checkedConnect defaultConnectInfo
+  let env = Env token secret conn
   runReaderT loop env
   run 3000 $ runReader app env
 
