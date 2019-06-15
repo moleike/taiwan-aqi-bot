@@ -10,41 +10,46 @@
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE TypeOperators     #-}
 
-import           Control.Concurrent.Lifted   (fork, threadDelay)
-import           Control.Exception           hiding (Handler)
-import           Control.Monad               (forM, forM_, forever)
+import           Control.Concurrent.Lifted            (fork, threadDelay)
+import           Control.Exception                    hiding (Handler)
+import           Control.Monad                        (forM, forM_, forever)
 import           Control.Monad.Error.Class
 import           Control.Monad.Except
-import           Control.Monad.IO.Class      (MonadIO, liftIO)
+import           Control.Monad.IO.Class               (MonadIO, liftIO)
 import           Control.Monad.Reader
-import           Control.Monad.Trans.Class   (lift)
-import           Control.Monad.Trans.Control (MonadBaseControl, restoreT)
-import           Control.Monad.Trans.Maybe   (runMaybeT)
+import           Control.Monad.Trans.Class            (lift)
+import           Control.Monad.Trans.Control          (MonadBaseControl,
+                                                       restoreT)
+import           Control.Monad.Trans.Maybe            (runMaybeT)
 import           Data.Aeson
-import           Data.Aeson.QQ               (aesonQQ)
+import           Data.Aeson.QQ                        (aesonQQ)
 import           Data.Aeson.Types
 import           Data.Bifunctor
-import qualified Data.ByteString             as BS
-import qualified Data.ByteString.Lazy        as LBS
-import           Data.List.Extra             (minimumOn)
-import           Data.Maybe                  (catMaybes)
-import           Data.String                 (fromString)
-import           Data.Text                   (Text)
-import qualified Data.Text                   as T
-import qualified Data.Vector                 as V
-import           Database.Redis              as R hiding (decode)
+import qualified Data.ByteString                      as BS
+import qualified Data.ByteString.Lazy                 as LBS
+import           Data.List.Extra                      (minimumOn)
+import           Data.Maybe                           (catMaybes)
+import           Data.String                          (fromString)
+import           Data.Text                            (Text)
+import qualified Data.Text                            as T
+import qualified Data.Vector                          as V
+import           Database.PostgreSQL.Simple           as P hiding ((:.))
+import           Database.PostgreSQL.Simple.FromField
+import           Database.PostgreSQL.Simple.SqlQQ
+import           Database.PostgreSQL.Simple.ToField
+import           Database.PostgreSQL.Simple.FromRow
 import           Line.Bot.Client
-import           Line.Bot.Types              as B
-import           Line.Bot.Webhook            as W
+import           Line.Bot.Types                       as B
+import           Line.Bot.Webhook                     as W
 import           Network.Connection
-import           Network.HTTP.Conduit        hiding (Proxy)
-import           Network.HTTP.Simple         hiding (Proxy)
-import           Network.Wai.Handler.Warp    (run)
+import           Network.HTTP.Conduit                 hiding (Proxy)
+import           Network.HTTP.Simple                  hiding (Proxy)
+import           Network.Wai.Handler.Warp             (run)
 import           Servant
 import           Servant.Client
-import           Servant.Server              (Context ((:.), EmptyContext))
-import           System.Environment          (getEnv)
-import           Text.Read                   (readMaybe)
+import           Servant.Server                       (Context ((:.), EmptyContext))
+import           System.Environment                   (getEnv)
+import           Text.Read                            (readMaybe)
 
 data AQData = AQData
     { aqi    :: Int
@@ -63,7 +68,7 @@ data AQData = AQData
 data Env = Env
   { envToken  :: ChannelToken
   , envSecret :: ChannelSecret
-  , envConn   :: R.Connection
+  , envConn   :: P.Connection
   }
 
 class Monad m => MonadChannel m where
@@ -74,41 +79,39 @@ instance Monad m => MonadChannel (ReaderT Env m) where
   getToken  = ask >>= return . envToken
   getSecret = ask >>= return . envSecret
 
-encodeStrict :: ToJSON a => a -> BS.ByteString
-encodeStrict = LBS.toStrict . encode
+instance FromField Source where
+  fromField = fromJSONField
 
-geoAdd :: (RedisCtx m f) => BS.ByteString -> Coord -> Source -> m (f Integer)
-geoAdd key (lat, lng) val  =
-  sendRequest $ ["GEOADD", key, encodeStrict lng, encodeStrict lat, encodeStrict val ]
+instance FromRow Source where
+  fromRow = field
 
-geoRadius
-  :: (RedisCtx m f)
-  => BS.ByteString
-  -> Coord
-  -> Double
-  -> BS.ByteString
-  -> m (f [BS.ByteString])
-geoRadius key (lat, lng) radius unit =
-  sendRequest $ ["GEORADIUS", key, encodeStrict lng, encodeStrict lat, encodeStrict radius, unit]
+instance ToField Source where
+  toField = toJSONField
 
 class Monad m => MonadDatabase m where
   getUsers :: Coord -> m [Source]
   addUser  :: Coord -> Source -> m ()
 
 instance MonadIO m => MonadDatabase (ReaderT Env m) where
-  getUsers coord = do
+  getUsers (lat, lng) = do
     Env{envConn} <- ask
-    result <- liftIO $ first show <$> runRedis envConn (geoRadius "users" coord 30 "km")
-    case result >>= sequence . fmap eitherDecodeStrict of
-      Left e  -> do
-        liftIO $ print e
-        return []
-      Right r -> return r
+    liftIO $ query envConn q (lng, lat, 30000 :: Double)
+    where
+      q = [sql|
+        SELECT source
+          FROM users
+         WHERE ST_DWithin(location, ST_Point(?, ?)::geography, ?)
+      |]
 
-  addUser coord src = do
+  addUser (lat, lng) src = do
     Env{envConn} <- ask
-    _ <- liftIO $ runRedis envConn (geoAdd "users" coord src)
+    _ <- liftIO $ execute envConn q (src, lng, lat)
     return ()
+    where
+      q = [sql|
+        INSERT INTO users(source, location)
+             VALUES (?, ST_SetSRID(ST_MakePoint(?, ?), 4326))
+      |]
 
 parseAQData :: Value -> Parser (Maybe AQData)
 parseAQData = withObject "AQData" $ \o -> runMaybeT $ do
@@ -192,9 +195,7 @@ unhealthy :: AQData -> Bool
 unhealthy AQData{..} = aqi > 100
 
 notifyChat :: (Source, AQData) -> Line NoContent
-notifyChat (Source a, x)
-  | unhealthy x = pushMessage a [mkMessage x]
-  | otherwise   = return NoContent
+notifyChat (Source a, x) = pushMessage a [mkMessage x]
 
 loop
   :: ( MonadChannel m
@@ -246,7 +247,7 @@ main :: IO ()
 main = do
   token  <- fromString <$> getEnv "CHANNEL_TOKEN"
   secret <- fromString <$> getEnv "CHANNEL_SECRET"
-  conn   <- checkedConnect defaultConnectInfo
+  conn   <- connect defaultConnectInfo
   let env = Env token secret conn
   runReaderT loop env
   run 3000 $ runReader app env

@@ -35,7 +35,7 @@ executable aqi-bot
                      , stm
                      , wai
                      , warp
-                     , hedis
+                     , postgresql-simple
                      , bytestring
   default-language:    Haskell2010
 
