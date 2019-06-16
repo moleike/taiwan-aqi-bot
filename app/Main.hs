@@ -35,16 +35,17 @@ import qualified Data.Text                            as T
 import qualified Data.Vector                          as V
 import           Database.PostgreSQL.Simple           as P hiding ((:.))
 import           Database.PostgreSQL.Simple.FromField
+import           Database.PostgreSQL.Simple.FromRow
 import           Database.PostgreSQL.Simple.SqlQQ
 import           Database.PostgreSQL.Simple.ToField
-import           Database.PostgreSQL.Simple.FromRow
+import           Database.PostgreSQL.Simple.ToRow
 import           Line.Bot.Client
 import           Line.Bot.Types                       as B
 import           Line.Bot.Webhook                     as W
 import           Network.Connection
 import           Network.HTTP.Conduit                 hiding (Proxy)
 import           Network.HTTP.Simple                  hiding (Proxy)
-import           Network.Wai.Handler.Warp             (run)
+import           Network.Wai.Handler.Warp             (runEnv)
 import           Servant
 import           Servant.Client
 import           Servant.Server                       (Context ((:.), EmptyContext))
@@ -82,36 +83,43 @@ instance Monad m => MonadChannel (ReaderT Env m) where
 instance FromField Source where
   fromField = fromJSONField
 
-instance FromRow Source where
-  fromRow = field
-
 instance ToField Source where
   toField = toJSONField
 
+instance FromRow Source where
+  fromRow = field
+
+instance ToRow Source where
+  toRow a = [toField a]
+
 class Monad m => MonadDatabase m where
-  getUsers :: Coord -> m [Source]
-  addUser  :: Coord -> Source -> m ()
+  getUsers   :: Coord -> m [Source]
+  addUser    :: Coord -> Source -> m ()
+  removeUser :: Source -> m ()
 
 instance MonadIO m => MonadDatabase (ReaderT Env m) where
   getUsers (lat, lng) = do
     Env{envConn} <- ask
     liftIO $ query envConn q (lng, lat, 30000 :: Double)
     where
-      q = [sql|
-        SELECT source
-          FROM users
-         WHERE ST_DWithin(location, ST_Point(?, ?)::geography, ?)
-      |]
-
+      q = [sql| SELECT source
+                  FROM users
+                 WHERE ST_DWithin(location, ST_Point(?, ?)::geography, ?)
+          |]
   addUser (lat, lng) src = do
     Env{envConn} <- ask
     _ <- liftIO $ execute envConn q (src, lng, lat)
     return ()
     where
-      q = [sql|
-        INSERT INTO users(source, location)
-             VALUES (?, ST_SetSRID(ST_MakePoint(?, ?), 4326))
-      |]
+      q = [sql| INSERT INTO users(source, location)
+                     VALUES (?, ST_SetSRID(ST_MakePoint(?, ?), 4326))
+          |]
+  removeUser src = do
+    Env{envConn} <- ask
+    _ <- liftIO $ execute envConn q src
+    return ()
+    where
+      q = [sql| DELETE FROM users WHERE source = ? |]
 
 parseAQData :: Value -> Parser (Maybe AQData)
 parseAQData = withObject "AQData" $ \o -> runMaybeT $ do
@@ -224,11 +232,13 @@ webhook
   -> m NoContent
 webhook events = do
   forM_ events $ \case
-    EventFollow  {..} -> askLoc replyToken
-    EventJoin    {..} -> askLoc replyToken
-    EventMessage { message = W.MessageLocation {..}
-                 , source
-                 }    -> addUser (latitude, longitude) source
+    EventFollow   {..} -> askLoc replyToken
+    EventJoin     {..} -> askLoc replyToken
+    EventUnfollow {..} -> removeUser source
+    EventLeave    {..} -> removeUser source
+    EventMessage  { message = W.MessageLocation {..}
+                  , source
+                  }    -> addUser (latitude, longitude) source
   return NoContent
 
 aqServer :: ServerT Webhook (ReaderT Env Handler)
@@ -247,10 +257,11 @@ main :: IO ()
 main = do
   token  <- fromString <$> getEnv "CHANNEL_TOKEN"
   secret <- fromString <$> getEnv "CHANNEL_SECRET"
-  conn   <- connect defaultConnectInfo
+  dbUrl  <- fromString <$> getEnv "DATABASE_URL"
+  conn   <- connectPostgreSQL dbUrl
   let env = Env token secret conn
   runReaderT loop env
-  run 3000 $ runReader app env
+  runEnv 3000 $ runReader app env
 
 mkMessage :: AQData -> B.Message
 mkMessage x = B.MessageFlex "air quality alert!" (flexContent x) Nothing
